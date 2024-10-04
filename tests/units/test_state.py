@@ -41,6 +41,7 @@ from reflex.state import (
 )
 from reflex.testing import chdir
 from reflex.utils import format, prerequisites, types
+from reflex.utils.exceptions import SetUndefinedStateVarError
 from reflex.utils.format import json_dumps
 from reflex.vars.base import ComputedVar, Var
 from tests.units.states.mutation import MutableSQLAModel, MutableTestState
@@ -3216,6 +3217,7 @@ class MixinState(State, mixin=True):
 
     num: int = 0
     _backend: int = 0
+    _backend_no_default: dict
 
     @rx.var(cache=True)
     def computed(self) -> str:
@@ -3243,10 +3245,15 @@ def test_mixin_state() -> None:
     """Test that a mixin state works correctly."""
     assert "num" in UsesMixinState.base_vars
     assert "num" in UsesMixinState.vars
-    assert UsesMixinState.backend_vars == {"_backend": 0}
+    assert UsesMixinState.backend_vars == {"_backend": 0, "_backend_no_default": {}}
 
     assert "computed" in UsesMixinState.computed_vars
     assert "computed" in UsesMixinState.vars
+
+    assert (
+        UsesMixinState(_reflex_internal_init=True)._backend_no_default  # type: ignore
+        is not UsesMixinState.backend_vars["_backend_no_default"]
+    )
 
 
 def test_child_mixin_state() -> None:
@@ -3256,3 +3263,45 @@ def test_child_mixin_state() -> None:
 
     assert "computed" in ChildUsesMixinState.inherited_vars
     assert "computed" not in ChildUsesMixinState.computed_vars
+
+
+def test_assignment_to_undeclared_vars():
+    """Test that an attribute error is thrown when undeclared vars are set."""
+
+    class State(BaseState):
+        val: str
+        _val: str
+        __val: str  # type: ignore
+
+        def handle_supported_regular_vars(self):
+            self.val = "no underscore"
+            self._val = "single leading underscore"
+            self.__val = "double leading undercore"
+
+        def handle_regular_var(self):
+            self.num = 5
+
+        def handle_backend_var(self):
+            self._num = 5
+
+        def handle_non_var(self):
+            self.__num = 5
+
+    class Substate(State):
+        def handle_var(self):
+            self.value = 20
+
+    state = State()  # type: ignore
+    sub_state = Substate()  # type: ignore
+
+    with pytest.raises(SetUndefinedStateVarError):
+        state.handle_regular_var()
+
+    with pytest.raises(SetUndefinedStateVarError):
+        sub_state.handle_var()
+
+    with pytest.raises(SetUndefinedStateVarError):
+        state.handle_backend_var()
+
+    state.handle_supported_regular_vars()
+    state.handle_non_var()

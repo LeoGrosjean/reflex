@@ -9,6 +9,7 @@ import dataclasses
 import functools
 import inspect
 import os
+import pickle
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -19,6 +20,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
+    BinaryIO,
     Callable,
     ClassVar,
     Dict,
@@ -30,18 +32,21 @@ from typing import (
     Type,
     Union,
     cast,
+    get_type_hints,
 )
 
-import dill
 from sqlalchemy.orm import DeclarativeBase
+from typing_extensions import Self
 
 from reflex.config import get_config
+from reflex.istate.data import RouterData
 from reflex.vars.base import (
     ComputedVar,
     DynamicRouteVar,
     Var,
     computed_var,
     dispatch,
+    get_unique_variable_name,
     is_computed_var,
 )
 
@@ -71,9 +76,11 @@ from reflex.utils.exceptions import (
     EventHandlerShadowsBuiltInStateMethod,
     ImmutableStateError,
     LockExpiredError,
+    SetUndefinedStateVarError,
+    StateSchemaMismatchError,
 )
 from reflex.utils.exec import is_testing_env
-from reflex.utils.serializers import SerializedType, serialize, serializer
+from reflex.utils.serializers import serializer
 from reflex.utils.types import override
 from reflex.vars import VarData
 
@@ -87,125 +94,6 @@ var = computed_var
 
 # If the state is this large, it's considered a performance issue.
 TOO_LARGE_SERIALIZED_STATE = 100 * 1024  # 100kb
-
-
-@dataclasses.dataclass(frozen=True)
-class HeaderData:
-    """An object containing headers data."""
-
-    host: str = ""
-    origin: str = ""
-    upgrade: str = ""
-    connection: str = ""
-    cookie: str = ""
-    pragma: str = ""
-    cache_control: str = ""
-    user_agent: str = ""
-    sec_websocket_version: str = ""
-    sec_websocket_key: str = ""
-    sec_websocket_extensions: str = ""
-    accept_encoding: str = ""
-    accept_language: str = ""
-
-    def __init__(self, router_data: Optional[dict] = None):
-        """Initalize the HeaderData object based on router_data.
-
-        Args:
-            router_data: the router_data dict.
-        """
-        if router_data:
-            for k, v in router_data.get(constants.RouteVar.HEADERS, {}).items():
-                object.__setattr__(self, format.to_snake_case(k), v)
-        else:
-            for k in dataclasses.fields(self):
-                object.__setattr__(self, k.name, "")
-
-
-@dataclasses.dataclass(frozen=True)
-class PageData:
-    """An object containing page data."""
-
-    host: str = ""  # repeated with self.headers.origin (remove or keep the duplicate?)
-    path: str = ""
-    raw_path: str = ""
-    full_path: str = ""
-    full_raw_path: str = ""
-    params: dict = dataclasses.field(default_factory=dict)
-
-    def __init__(self, router_data: Optional[dict] = None):
-        """Initalize the PageData object based on router_data.
-
-        Args:
-            router_data: the router_data dict.
-        """
-        if router_data:
-            object.__setattr__(
-                self,
-                "host",
-                router_data.get(constants.RouteVar.HEADERS, {}).get("origin", ""),
-            )
-            object.__setattr__(
-                self, "path", router_data.get(constants.RouteVar.PATH, "")
-            )
-            object.__setattr__(
-                self, "raw_path", router_data.get(constants.RouteVar.ORIGIN, "")
-            )
-            object.__setattr__(self, "full_path", f"{self.host}{self.path}")
-            object.__setattr__(self, "full_raw_path", f"{self.host}{self.raw_path}")
-            object.__setattr__(
-                self, "params", router_data.get(constants.RouteVar.QUERY, {})
-            )
-        else:
-            object.__setattr__(self, "host", "")
-            object.__setattr__(self, "path", "")
-            object.__setattr__(self, "raw_path", "")
-            object.__setattr__(self, "full_path", "")
-            object.__setattr__(self, "full_raw_path", "")
-            object.__setattr__(self, "params", {})
-
-
-@dataclasses.dataclass(frozen=True, init=False)
-class SessionData:
-    """An object containing session data."""
-
-    client_token: str = ""
-    client_ip: str = ""
-    session_id: str = ""
-
-    def __init__(self, router_data: Optional[dict] = None):
-        """Initalize the SessionData object based on router_data.
-
-        Args:
-            router_data: the router_data dict.
-        """
-        if router_data:
-            client_token = router_data.get(constants.RouteVar.CLIENT_TOKEN, "")
-            client_ip = router_data.get(constants.RouteVar.CLIENT_IP, "")
-            session_id = router_data.get(constants.RouteVar.SESSION_ID, "")
-        else:
-            client_token = client_ip = session_id = ""
-        object.__setattr__(self, "client_token", client_token)
-        object.__setattr__(self, "client_ip", client_ip)
-        object.__setattr__(self, "session_id", session_id)
-
-
-@dataclasses.dataclass(frozen=True, init=False)
-class RouterData:
-    """An object containing RouterData."""
-
-    session: SessionData = dataclasses.field(default_factory=SessionData)
-    headers: HeaderData = dataclasses.field(default_factory=HeaderData)
-    page: PageData = dataclasses.field(default_factory=PageData)
-
-    def __init__(self, router_data: Optional[dict] = None):
-        """Initialize the RouterData object.
-
-        Args:
-            router_data: the router_data dict.
-        """
-        object.__setattr__(self, "session", SessionData(router_data))
-        object.__setattr__(self, "headers", HeaderData(router_data))
-        object.__setattr__(self, "page", PageData(router_data))
 
 
 def _no_chain_background_task(
@@ -573,6 +461,15 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
             for name, value in cls.__dict__.items()
             if types.is_backend_base_variable(name, cls)
         }
+        # Add annotated backend vars that do not have a default value.
+        new_backend_vars.update(
+            {
+                name: Var("", _var_type=annotation_value).get_default_value()
+                for name, annotation_value in get_type_hints(cls).items()
+                if name not in new_backend_vars
+                and types.is_backend_base_variable(name, cls)
+            }
+        )
 
         cls.backend_vars = {
             **cls.inherited_backend_vars,
@@ -684,6 +581,48 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
             and not isinstance(value, EventHandler)
             and hasattr(value, "__code__")
         )
+
+    @classmethod
+    def _evaluate(
+        cls, f: Callable[[Self], Any], of_type: Union[type, None] = None
+    ) -> Var:
+        """Evaluate a function to a ComputedVar. Experimental.
+
+        Args:
+            f: The function to evaluate.
+            of_type: The type of the ComputedVar. Defaults to Component.
+
+        Returns:
+            The ComputedVar.
+        """
+        console.warn(
+            "The _evaluate method is experimental and may be removed in future versions."
+        )
+        from reflex.components.component import Component
+
+        of_type = of_type or Component
+
+        unique_var_name = get_unique_variable_name()
+
+        @computed_var(_js_expr=unique_var_name, return_type=of_type)
+        def computed_var_func(state: Self):
+            result = f(state)
+
+            if not isinstance(result, of_type):
+                console.warn(
+                    f"Inline ComputedVar {f} expected type {of_type}, got {type(result)}. "
+                    "You can specify expected type with `of_type` argument."
+                )
+
+            return result
+
+        setattr(cls, unique_var_name, computed_var_func)
+        cls.computed_vars[unique_var_name] = computed_var_func
+        cls.vars[unique_var_name] = computed_var_func
+        cls._update_substate_inherited_vars({unique_var_name: computed_var_func})
+        cls._always_dirty_computed_vars.add(unique_var_name)
+
+        return getattr(cls, unique_var_name)
 
     @classmethod
     def _mixins(cls) -> List[Type]:
@@ -828,6 +767,9 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
     def get_parent_state(cls) -> Type[BaseState] | None:
         """Get the parent state.
 
+        Raises:
+            ValueError: If more than one parent state is found.
+
         Returns:
             The parent state.
         """
@@ -836,9 +778,8 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
             for base in cls.__bases__
             if issubclass(base, BaseState) and base is not BaseState and not base._mixin
         ]
-        assert (
-            len(parent_states) < 2
-        ), f"Only one parent state is allowed {parent_states}."
+        if len(parent_states) >= 2:
+            raise ValueError(f"Only one parent state is allowed {parent_states}.")
         return parent_states[0] if len(parent_states) == 1 else None  # type: ignore
 
     @classmethod
@@ -1216,6 +1157,9 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
         Args:
             name: The name of the attribute.
             value: The value of the attribute.
+
+        Raises:
+            SetUndefinedStateVarError: If a value of a var is set without first defining it.
         """
         if isinstance(value, MutableProxy):
             # unwrap proxy objects when assigning back to the state
@@ -1232,6 +1176,17 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
             self.dirty_vars.add(name)
             self._mark_dirty()
             return
+
+        if (
+            name not in self.vars
+            and name not in self.get_skip_vars()
+            and not name.startswith("__")
+            and not name.startswith(f"_{type(self).__name__}__")
+        ):
+            raise SetUndefinedStateVarError(
+                f"The state variable '{name}' has not been defined in '{type(self).__name__}'. "
+                f"All state variables must be declared before they can be set."
+            )
 
         # Set the attribute.
         super().__setattr__(name, value)
@@ -1790,9 +1745,6 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
         for substate in self.dirty_substates.union(self._always_dirty_substates):
             delta.update(substates[substate].get_delta())
 
-        # Format the delta.
-        delta = format.format_state(delta)
-
         # Return the delta.
         return delta
 
@@ -1964,7 +1916,7 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
     def __getstate__(self):
         """Get the state for redis serialization.
 
-        This method is called by cloudpickle to serialize the object.
+        This method is called by pickle to serialize the object.
 
         It explicitly removes parent_state and substates because those are serialized separately
         by the StateManagerRedis to allow for better horizontal scaling as state size increases.
@@ -1978,6 +1930,43 @@ class BaseState(Base, ABC, extra=pydantic.Extra.allow):
         state["__dict__"]["parent_state"] = None
         state["__dict__"]["substates"] = {}
         state["__dict__"].pop("_was_touched", None)
+        return state
+
+    def _serialize(self) -> bytes:
+        """Serialize the state for redis.
+
+        Returns:
+            The serialized state.
+        """
+        return pickle.dumps((state_to_schema(self), self))
+
+    @classmethod
+    def _deserialize(
+        cls, data: bytes | None = None, fp: BinaryIO | None = None
+    ) -> BaseState:
+        """Deserialize the state from redis/disk.
+
+        data and fp are mutually exclusive, but one must be provided.
+
+        Args:
+            data: The serialized state data.
+            fp: The file pointer to the serialized state data.
+
+        Returns:
+            The deserialized state.
+
+        Raises:
+            ValueError: If both data and fp are provided, or neither are provided.
+            StateSchemaMismatchError: If the state schema does not match the expected schema.
+        """
+        if data is not None and fp is None:
+            (substate_schema, state) = pickle.loads(data)
+        elif fp is not None and data is None:
+            (substate_schema, state) = pickle.load(fp)
+        else:
+            raise ValueError("Only one of `data` or `fp` must be provided")
+        if substate_schema != state_to_schema(state):
+            raise StateSchemaMismatchError()
         return state
 
 
@@ -2136,7 +2125,11 @@ class ComponentState(State, mixin=True):
         """
         cls._per_component_state_instance_count += 1
         state_cls_name = f"{cls.__name__}_n{cls._per_component_state_instance_count}"
-        component_state = type(state_cls_name, (cls, State), {}, mixin=False)
+        component_state = type(
+            state_cls_name, (cls, State), {"__module__": __name__}, mixin=False
+        )
+        # Save a reference to the dynamic state for pickle/unpickle.
+        globals()[state_cls_name] = component_state
         component = component_state.get_component(*children, **props)
         component.State = component_state
         return component
@@ -2433,7 +2426,7 @@ class StateUpdate:
         Returns:
             The state update as a JSON string.
         """
-        return format.json_dumps(dataclasses.asdict(self))
+        return format.json_dumps(self)
 
 
 class StateManager(Base, ABC):
@@ -2592,16 +2585,24 @@ def _serialize_type(type_: Any) -> str:
     return f"{type_.__module__}.{type_.__qualname__}"
 
 
+def is_serializable(value: Any) -> bool:
+    """Check if a value is serializable.
+
+    Args:
+        value: The value to check.
+
+    Returns:
+        Whether the value is serializable.
+    """
+    try:
+        return bool(pickle.dumps(value))
+    except Exception:
+        return False
+
+
 def state_to_schema(
     state: BaseState,
-) -> List[
-    Tuple[
-        str,
-        str,
-        Any,
-        Union[bool, None],
-    ]
-]:
+) -> List[Tuple[str, str, Any, Union[bool, None], Any]]:
     """Convert a state to a schema.
 
     Args:
@@ -2621,6 +2622,7 @@ def state_to_schema(
                     if isinstance(model_field.required, bool)
                     else None
                 ),
+                (model_field.default if is_serializable(model_field.default) else None),
             )
             for field_name, model_field in state.__fields__.items()
         )
@@ -2729,8 +2731,7 @@ class StateManagerDisk(StateManager):
         if token_path.exists():
             try:
                 with token_path.open(mode="rb") as file:
-                    (substate_schema, substate) = dill.load(file)
-                if substate_schema == state_to_schema(substate):
+                    substate = BaseState._deserialize(fp=file)
                     await self.populate_substates(client_token, substate, root_state)
                     return substate
             except Exception:
@@ -2772,10 +2773,12 @@ class StateManagerDisk(StateManager):
         client_token, substate_address = _split_substate_key(token)
 
         root_state_token = _substate_key(client_token, substate_address.split(".")[0])
+        root_state = self.states.get(root_state_token)
+        if root_state is None:
+            # Create a new root state which will be persisted in the next set_state call.
+            root_state = self.state(_reflex_internal_init=True)
 
-        return await self.load_state(
-            root_state_token, self.state(_reflex_internal_init=True)
-        )
+        return await self.load_state(root_state_token, root_state)
 
     async def set_state_for_substate(self, client_token: str, substate: BaseState):
         """Set the state for a substate.
@@ -2788,7 +2791,7 @@ class StateManagerDisk(StateManager):
 
         self.states[substate_token] = substate
 
-        state_dilled = dill.dumps((state_to_schema(substate), substate))
+        state_dilled = substate._serialize()
         if not self.states_directory.exists():
             self.states_directory.mkdir(parents=True, exist_ok=True)
         self.token_path(substate_token).write_bytes(state_dilled)
@@ -2829,25 +2832,6 @@ class StateManagerDisk(StateManager):
             state = await self.get_state(token)
             yield state
             await self.set_state(token, state)
-
-
-# Workaround https://github.com/cloudpipe/cloudpickle/issues/408 for dynamic pydantic classes
-if not isinstance(State.validate.__func__, FunctionType):
-    cython_function_or_method = type(State.validate.__func__)
-
-    @dill.register(cython_function_or_method)
-    def _dill_reduce_cython_function_or_method(pickler, obj):
-        # Ignore cython function when pickling.
-        pass
-
-
-@dill.register(type(State))
-def _dill_reduce_state(pickler, obj):
-    if obj is not State and issubclass(obj, State):
-        # Avoid serializing subclasses of State, instead get them by reference from the State class.
-        pickler.save_reduce(State.get_class_substate, (obj.get_full_name(),), obj=obj)
-    else:
-        dill.Pickler.dispatch[type](pickler, obj)
 
 
 def _default_lock_expiration() -> int:
@@ -2989,7 +2973,7 @@ class StateManagerRedis(StateManager):
 
         if redis_state is not None:
             # Deserialize the substate.
-            state = dill.loads(redis_state)
+            state = BaseState._deserialize(data=redis_state)
 
             # Populate parent state if missing and requested.
             if parent_state is None:
@@ -3101,7 +3085,7 @@ class StateManagerRedis(StateManager):
             )
         # Persist only the given state (parents or substates are excluded by BaseState.__getstate__).
         if state._get_was_touched():
-            pickle_state = dill.dumps(state, byref=True)
+            pickle_state = state._serialize()
             self._warn_if_too_large(state, len(pickle_state))
             await self.redis.set(
                 _substate_key(client_token, state),
@@ -3651,22 +3635,16 @@ class MutableProxy(wrapt.ObjectProxy):
 
 
 @serializer
-def serialize_mutable_proxy(mp: MutableProxy) -> SerializedType:
-    """Serialize the wrapped value of a MutableProxy.
+def serialize_mutable_proxy(mp: MutableProxy):
+    """Return the wrapped value of a MutableProxy.
 
     Args:
         mp: The MutableProxy to serialize.
 
     Returns:
-        The serialized wrapped object.
-
-    Raises:
-        ValueError: when the wrapped object is not serializable.
+        The wrapped object.
     """
-    value = serialize(mp.__wrapped__)
-    if value is None:
-        raise ValueError(f"Cannot serialize {type(mp.__wrapped__)}")
-    return value
+    return mp.__wrapped__
 
 
 class ImmutableMutableProxy(MutableProxy):
