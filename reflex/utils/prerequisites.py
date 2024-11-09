@@ -33,11 +33,14 @@ from redis.asyncio import Redis
 
 from reflex import constants, model
 from reflex.compiler import templates
-from reflex.config import Config, get_config
+from reflex.config import Config, environment, get_config
 from reflex.utils import console, net, path_ops, processes
-from reflex.utils.exceptions import GeneratedCodeHasNoFunctionDefs
+from reflex.utils.exceptions import (
+    GeneratedCodeHasNoFunctionDefs,
+    raise_system_package_missing_error,
+)
 from reflex.utils.format import format_library_name
-from reflex.utils.registry import _get_best_registry
+from reflex.utils.registry import _get_npm_registry
 
 CURRENTLY_INSTALLING_NODE = False
 
@@ -69,8 +72,7 @@ def get_web_dir() -> Path:
     Returns:
         The working directory.
     """
-    workdir = Path(os.getenv("REFLEX_WEB_WORKDIR", constants.Dirs.WEB))
-    return workdir
+    return environment.REFLEX_WEB_WORKDIR.get()
 
 
 def _python_version_check():
@@ -146,14 +148,9 @@ def check_node_version() -> bool:
         Whether the version of Node.js is valid.
     """
     current_version = get_node_version()
-    if current_version:
-        # Compare the version numbers
-        return (
-            current_version >= version.parse(constants.Node.MIN_VERSION)
-            if constants.IS_WINDOWS or path_ops.use_system_node()
-            else current_version == version.parse(constants.Node.VERSION)
-        )
-    return False
+    return current_version is not None and current_version >= version.parse(
+        constants.Node.MIN_VERSION
+    )
 
 
 def get_node_version() -> version.Version | None:
@@ -210,9 +207,12 @@ def get_bun_version() -> version.Version | None:
         return None
 
 
-def get_install_package_manager() -> str | None:
+def get_install_package_manager(on_failure_return_none: bool = False) -> str | None:
     """Get the package manager executable for installation.
       Currently, bun is used for installation only.
+
+    Args:
+        on_failure_return_none: Whether to return None on failure.
 
     Returns:
         The path to the package manager.
@@ -223,21 +223,29 @@ def get_install_package_manager() -> str | None:
         or windows_check_onedrive_in_path()
         or windows_npm_escape_hatch()
     ):
-        return get_package_manager()
+        return get_package_manager(on_failure_return_none)
     return str(get_config().bun_path)
 
 
-def get_package_manager() -> str | None:
+def get_package_manager(on_failure_return_none: bool = False) -> str | None:
     """Get the package manager executable for running app.
       Currently on unix systems, npm is used for running the app only.
 
+    Args:
+        on_failure_return_none: Whether to return None on failure.
+
     Returns:
         The path to the package manager.
+
+    Raises:
+        FileNotFoundError: If the package manager is not found.
     """
     npm_path = path_ops.get_npm_path()
     if npm_path is not None:
-        npm_path = str(Path(npm_path).resolve())
-    return npm_path
+        return str(Path(npm_path).resolve())
+    if on_failure_return_none:
+        return None
+    raise FileNotFoundError("NPM not found. You may need to run `reflex init`.")
 
 
 def windows_check_onedrive_in_path() -> bool:
@@ -255,7 +263,7 @@ def windows_npm_escape_hatch() -> bool:
     Returns:
         If the user has set REFLEX_USE_NPM.
     """
-    return os.environ.get("REFLEX_USE_NPM", "").lower() in ["true", "1", "yes"]
+    return environment.REFLEX_USE_NPM.get()
 
 
 def get_app(reload: bool = False) -> ModuleType:
@@ -273,7 +281,7 @@ def get_app(reload: bool = False) -> ModuleType:
     from reflex.utils import telemetry
 
     try:
-        os.environ[constants.RELOAD_CONFIG] = str(reload)
+        environment.RELOAD_CONFIG.set(reload)
         config = get_config()
         if not config.app_name:
             raise RuntimeError(
@@ -436,7 +444,7 @@ def create_config(app_name: str):
 
 def initialize_gitignore(
     gitignore_file: Path = constants.GitIgnore.FILE,
-    files_to_ignore: set[str] = constants.GitIgnore.DEFAULTS,
+    files_to_ignore: set[str] | list[str] = constants.GitIgnore.DEFAULTS,
 ):
     """Initialize the template .gitignore file.
 
@@ -445,23 +453,20 @@ def initialize_gitignore(
         files_to_ignore: The files to add to the .gitignore file.
     """
     # Combine with the current ignored files.
-    current_ignore: set[str] = set()
+    current_ignore: list[str] = []
     if gitignore_file.exists():
-        current_ignore |= set(
-            line.strip() for line in gitignore_file.read_text().splitlines()
-        )
+        current_ignore = [ln.strip() for ln in gitignore_file.read_text().splitlines()]
 
     if files_to_ignore == current_ignore:
         console.debug(f"{gitignore_file} already up to date.")
         return
-    files_to_ignore |= current_ignore
+    files_to_ignore = [ln for ln in files_to_ignore if ln not in current_ignore]
+    files_to_ignore += current_ignore
 
     # Write files to the .gitignore file.
     gitignore_file.touch(exist_ok=True)
     console.debug(f"Creating {gitignore_file}")
-    gitignore_file.write_text(
-        "\n".join(sorted(files_to_ignore)) + "\n",
-    )
+    gitignore_file.write_text("\n".join(files_to_ignore) + "\n")
 
 
 def initialize_requirements_txt():
@@ -593,6 +598,8 @@ def initialize_web_directory():
 
     initialize_package_json()
 
+    initialize_bun_config()
+
     path_ops.mkdir(get_web_dir() / constants.Dirs.PUBLIC)
 
     update_next_config()
@@ -617,17 +624,21 @@ def _compile_package_json():
 def initialize_package_json():
     """Render and write in .web the package.json file."""
     output_path = get_web_dir() / constants.PackageJson.PATH
-    code = _compile_package_json()
-    output_path.write_text(code)
+    output_path.write_text(_compile_package_json())
 
-    best_registry = _get_best_registry()
+
+def initialize_bun_config():
+    """Initialize the bun config file."""
     bun_config_path = get_web_dir() / constants.Bun.CONFIG_PATH
-    bun_config_path.write_text(
-        f"""
-[install]
-registry = "{best_registry}"
-"""
-    )
+
+    if (custom_bunfig := Path(constants.Bun.CONFIG_PATH)).exists():
+        bunfig_content = custom_bunfig.read_text()
+        console.info(f"Copying custom bunfig.toml inside {get_web_dir()} folder")
+    else:
+        best_registry = _get_npm_registry()
+        bunfig_content = constants.Bun.DEFAULT_CONFIG.format(registry=best_registry)
+
+    bun_config_path.write_text(bunfig_content)
 
 
 def init_reflex_json(project_hash: int | None):
@@ -683,6 +694,7 @@ def _update_next_config(
         "compress": config.next_compression,
         "reactStrictMode": config.react_strict_mode,
         "trailingSlash": True,
+        "staticPageGenerationTimeout": config.static_page_generation_timeout,
     }
     if transpile_packages:
         next_config["transpilePackages"] = list(
@@ -817,11 +829,7 @@ def install_node():
 
 
 def install_bun():
-    """Install bun onto the user's system.
-
-    Raises:
-        FileNotFoundError: If required packages are not found.
-    """
+    """Install bun onto the user's system."""
     win_supported = is_windows_bun_supported()
     one_drive_in_path = windows_check_onedrive_in_path()
     if constants.IS_WINDOWS and not win_supported or one_drive_in_path:
@@ -860,7 +868,7 @@ def install_bun():
     else:
         unzip_path = path_ops.which("unzip")
         if unzip_path is None:
-            raise FileNotFoundError("Reflex requires unzip to be installed.")
+            raise_system_package_missing_error("unzip")
 
         # Run the bun install script.
         download_and_run(
@@ -925,20 +933,39 @@ def install_frontend_packages(packages: set[str], config: Config):
         packages: A list of package names to be installed.
         config: The config object.
 
+    Raises:
+        FileNotFoundError: If the package manager is not found.
+
     Example:
         >>> install_frontend_packages(["react", "react-dom"], get_config())
     """
     # unsupported archs(arm and 32bit machines) will use npm anyway. so we dont have to run npm twice
     fallback_command = (
-        get_package_manager()
-        if not constants.IS_WINDOWS
-        or constants.IS_WINDOWS
-        and is_windows_bun_supported()
-        and not windows_check_onedrive_in_path()
+        get_package_manager(on_failure_return_none=True)
+        if (
+            not constants.IS_WINDOWS
+            or constants.IS_WINDOWS
+            and is_windows_bun_supported()
+            and not windows_check_onedrive_in_path()
+        )
         else None
     )
+
+    install_package_manager = (
+        get_install_package_manager(on_failure_return_none=True) or fallback_command
+    )
+
+    if install_package_manager is None:
+        raise FileNotFoundError(
+            "Could not find a package manager to install frontend packages. You may need to run `reflex init`."
+        )
+
+    fallback_command = (
+        fallback_command if fallback_command is not install_package_manager else None
+    )
+
     processes.run_process_with_fallback(
-        [get_install_package_manager(), "install"],  # type: ignore
+        [install_package_manager, "install"],  # type: ignore
         fallback=fallback_command,
         analytics_enabled=True,
         show_status_message="Installing base frontend packages",
@@ -949,7 +976,7 @@ def install_frontend_packages(packages: set[str], config: Config):
     if config.tailwind is not None:
         processes.run_process_with_fallback(
             [
-                get_install_package_manager(),
+                install_package_manager,
                 "add",
                 "-d",
                 constants.Tailwind.VERSION,
@@ -965,7 +992,7 @@ def install_frontend_packages(packages: set[str], config: Config):
     # Install custom packages defined in frontend_packages
     if len(packages) > 0:
         processes.run_process_with_fallback(
-            [get_install_package_manager(), "add", *packages],
+            [install_package_manager, "add", *packages],
             fallback=fallback_command,
             analytics_enabled=True,
             show_status_message="Installing frontend packages from config and components",
@@ -997,7 +1024,7 @@ def needs_reinit(frontend: bool = True) -> bool:
         return False
 
     # Make sure the .reflex directory exists.
-    if not constants.Reflex.DIR.exists():
+    if not environment.REFLEX_DIR.get().exists():
         return True
 
     # Make sure the .web directory exists in frontend mode.
@@ -1102,7 +1129,7 @@ def ensure_reflex_installation_id() -> Optional[int]:
     """
     try:
         initialize_reflex_user_directory()
-        installation_id_file = constants.Reflex.DIR / "installation_id"
+        installation_id_file = environment.REFLEX_DIR.get() / "installation_id"
 
         installation_id = None
         if installation_id_file.exists():
@@ -1127,7 +1154,7 @@ def ensure_reflex_installation_id() -> Optional[int]:
 def initialize_reflex_user_directory():
     """Initialize the reflex user directory."""
     # Create the reflex directory.
-    path_ops.mkdir(constants.Reflex.DIR)
+    path_ops.mkdir(environment.REFLEX_DIR.get())
 
 
 def initialize_frontend_dependencies():
@@ -1150,7 +1177,10 @@ def check_db_initialized() -> bool:
     Returns:
         True if alembic is initialized (or if database is not used).
     """
-    if get_config().db_url is not None and not Path(constants.ALEMBIC_CONFIG).exists():
+    if (
+        get_config().db_url is not None
+        and not environment.ALEMBIC_CONFIG.get().exists()
+    ):
         console.error(
             "Database is not initialized. Run [bold]reflex db init[/bold] first."
         )
@@ -1160,7 +1190,7 @@ def check_db_initialized() -> bool:
 
 def check_schema_up_to_date():
     """Check if the sqlmodel metadata matches the current database schema."""
-    if get_config().db_url is None or not Path(constants.ALEMBIC_CONFIG).exists():
+    if get_config().db_url is None or not environment.ALEMBIC_CONFIG.get().exists():
         return
     with model.Model.get_db_engine().connect() as connection:
         try:

@@ -2,7 +2,7 @@
 
 from typing import Any, Literal, Optional, Union
 
-from reflex.event import EventHandler
+from reflex.event import EventHandler, no_args_event_spec
 from reflex.utils import types
 from reflex.vars.base import Var
 
@@ -56,10 +56,10 @@ class Image(NextComponent):
     blurDataURL: Var[str]
 
     # Fires when the image has loaded.
-    on_load: EventHandler[lambda: []]
+    on_load: EventHandler[no_args_event_spec]
 
     # Fires when the image has an error.
-    on_error: EventHandler[lambda: []]
+    on_error: EventHandler[no_args_event_spec]
 
     @classmethod
     def create(

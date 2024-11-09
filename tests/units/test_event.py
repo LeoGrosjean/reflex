@@ -1,12 +1,19 @@
-from typing import List
+from typing import Callable, List
 
 import pytest
 
-from reflex import event
-from reflex.event import Event, EventHandler, EventSpec, call_event_handler, fix_events
+from reflex.event import (
+    Event,
+    EventChain,
+    EventHandler,
+    EventSpec,
+    call_event_handler,
+    event,
+    fix_events,
+)
 from reflex.state import BaseState
 from reflex.utils import format
-from reflex.vars.base import LiteralVar, Var
+from reflex.vars.base import Field, LiteralVar, Var, field
 
 
 def make_var(value) -> Var:
@@ -100,7 +107,7 @@ def test_call_event_handler_partial():
     def spec(a2: Var[str]) -> List[Var[str]]:
         return [a2]
 
-    handler = EventHandler(fn=test_fn_with_args)
+    handler = EventHandler(fn=test_fn_with_args, state_full_name="BigState")
     event_spec = handler(make_var("first"))
     event_spec2 = call_event_handler(event_spec, spec)
 
@@ -108,7 +115,10 @@ def test_call_event_handler_partial():
     assert len(event_spec.args) == 1
     assert event_spec.args[0][0].equals(Var(_js_expr="arg1"))
     assert event_spec.args[0][1].equals(Var(_js_expr="first"))
-    assert format.format_event(event_spec) == 'Event("test_fn_with_args", {arg1:first})'
+    assert (
+        format.format_event(event_spec)
+        == 'Event("BigState.test_fn_with_args", {arg1:first})'
+    )
 
     assert event_spec2 is not event_spec
     assert event_spec2.handler == handler
@@ -119,7 +129,7 @@ def test_call_event_handler_partial():
     assert event_spec2.args[1][1].equals(Var(_js_expr="_a2", _var_type=str))
     assert (
         format.format_event(event_spec2)
-        == 'Event("test_fn_with_args", {arg1:first,arg2:_a2})'
+        == 'Event("BigState.test_fn_with_args", {arg1:first,arg2:_a2})'
     )
 
 
@@ -209,24 +219,40 @@ def test_event_console_log():
     """Test the event console log function."""
     spec = event.console_log("message")
     assert isinstance(spec, EventSpec)
-    assert spec.handler.fn.__qualname__ == "_console"
-    assert spec.args[0][0].equals(Var(_js_expr="message"))
-    assert spec.args[0][1].equals(LiteralVar.create("message"))
-    assert format.format_event(spec) == 'Event("_console", {message:"message"})'
+    assert spec.handler.fn.__qualname__ == "_call_function"
+    assert spec.args[0][0].equals(Var(_js_expr="function"))
+    assert spec.args[0][1].equals(
+        Var('(() => (console["log"]("message")))', _var_type=Callable)
+    )
+    assert (
+        format.format_event(spec)
+        == 'Event("_call_function", {function:(() => (console["log"]("message")))})'
+    )
     spec = event.console_log(Var(_js_expr="message"))
-    assert format.format_event(spec) == 'Event("_console", {message:message})'
+    assert (
+        format.format_event(spec)
+        == 'Event("_call_function", {function:(() => (console["log"](message)))})'
+    )
 
 
 def test_event_window_alert():
     """Test the event window alert function."""
     spec = event.window_alert("message")
     assert isinstance(spec, EventSpec)
-    assert spec.handler.fn.__qualname__ == "_alert"
-    assert spec.args[0][0].equals(Var(_js_expr="message"))
-    assert spec.args[0][1].equals(LiteralVar.create("message"))
-    assert format.format_event(spec) == 'Event("_alert", {message:"message"})'
+    assert spec.handler.fn.__qualname__ == "_call_function"
+    assert spec.args[0][0].equals(Var(_js_expr="function"))
+    assert spec.args[0][1].equals(
+        Var('(() => (window["alert"]("message")))', _var_type=Callable)
+    )
+    assert (
+        format.format_event(spec)
+        == 'Event("_call_function", {function:(() => (window["alert"]("message")))})'
+    )
     spec = event.window_alert(Var(_js_expr="message"))
-    assert format.format_event(spec) == 'Event("_alert", {message:message})'
+    assert (
+        format.format_event(spec)
+        == 'Event("_call_function", {function:(() => (window["alert"](message)))})'
+    )
 
 
 def test_set_focus():
@@ -388,3 +414,28 @@ def test_event_actions_on_state():
     assert sp_handler.event_actions == {"stopPropagation": True}
     # should NOT affect other references to the handler
     assert not handler.event_actions
+
+
+def test_event_var_data():
+    class S(BaseState):
+        x: Field[int] = field(0)
+
+        @event
+        def s(self, value: int):
+            pass
+
+    # Handler doesn't have any _var_data because it's just a str
+    handler_var = Var.create(S.s)
+    assert handler_var._get_all_var_data() is None
+
+    # Ensure spec carries _var_data
+    spec_var = Var.create(S.s(S.x))
+    assert spec_var._get_all_var_data() == S.x._get_all_var_data()
+
+    # Needed to instantiate the EventChain
+    def _args_spec(value: Var[int]) -> tuple[Var[int]]:
+        return (value,)
+
+    # Ensure chain carries _var_data
+    chain_var = Var.create(EventChain(events=[S.s(S.x)], args_spec=_args_spec))
+    assert chain_var._get_all_var_data() == S.x._get_all_var_data()
